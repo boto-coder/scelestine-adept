@@ -16,9 +16,8 @@ import glob
 import json
 import logging
 import os
-import re
-import shutil
-import subprocess
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("plugins.scelestine-adept.store")
@@ -84,80 +83,116 @@ def available(ctx: Any) -> bool:
     return verdict
 
 
-# --- CLI fallback ----------------------------------------------------------
+# --- in-process fallback ----------------------------------------------------
 # skip_memory forks (background_review, curator) never bind the mnemosyne
 # provider, so ctx.dispatch_tool("mnemosyne_remember") returns "Unknown tool".
-# The CLI writes the SAME database (verified: CLI and provider both reported
-# 35 working memories, DB = ~/.hermes/mnemosyne/data/mnemosyne.db), and it
-# embeds on write (verified: store -> recall returned the row, score 0.551).
-# This is a WRITE-ONLY path: it never reads, so it does not reopen the
-# session-scoped read leak that skip_memory exists to prevent.
-
-CLI_TIMEOUT_S = 45
-# The CLI defaults to scope="session" (cli.py:_resolve_default_scope), which
-# would hide lessons from every later session. Lessons must be global.
-CLI_SCOPE_ENV = "MNEMOSYNE_DEFAULT_SCOPE"
-# No stable symlink exists, and the gateway PATH does not carry the venv bin
-# (verified against /proc/<pid>/environ), so shutil.which() alone is not enough.
-_CLI_GLOB = "~/.hermes/installs/*/environments/*/venv/bin/mnemosyne"
+# The provider is not importable here by default (ModuleNotFoundError,
+# verified), so add its venv site-packages to sys.path and call Mnemosyne
+# directly. Properties that were verified before choosing this path:
+#   * same DB as the provider (both reported 35 working memories at
+#     ~/.hermes/mnemosyne/data/mnemosyne.db) and it embeds on write
+#     (store -> recall returned the row, score 0.551);
+#   * WRITE-ONLY — it never reads, so it does not reopen the session-scoped
+#     read leak that skip_memory exists to prevent;
+#   * scope passed explicitly as LESSON_SCOPE ("global"), so a lesson written
+#     during a fork stays recallable in later sessions (the CLI's implicit
+#     "session" default would not, and no env var is needed in-process).
+# The path is APPENDED, never prepended: every package Hermes already ships
+# keeps its own version and wins over the venv's.
+_SP_GLOB = "~/.hermes/installs/*/environments/*/venv/lib/python*/site-packages"
 _UNSET = object()
 
-_cli_path: Any = _UNSET
+_sp_path: Any = _UNSET       # site-packages dir, None, or unresolved
+_im_ready: Any = _UNSET      # (Mnemosyne, db_path, bank), None, or unresolved
 
 
-def find_cli() -> Optional[str]:
-    """Absolute path to the mnemosyne binary, or None. Resolved once per process."""
-    global _cli_path
-    if _cli_path is not _UNSET:
-        return _cli_path
-    path = shutil.which("mnemosyne")
-    if not path:
-        candidates = sorted(glob.glob(os.path.expanduser(_CLI_GLOB)),
-                            key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
-                            reverse=True)
-        path = candidates[0] if candidates else None
-    _cli_path = path
-    if path:
-        logger.debug("mnemosyne CLI fallback available: %s", path)
+def find_packages() -> Optional[str]:
+    """site-packages that ship mnemosyne, or None. Resolved once per process."""
+    global _sp_path
+    if _sp_path is not _UNSET:
+        return _sp_path
+    _sp_path = None
+    for cand in sorted(glob.glob(os.path.expanduser(_SP_GLOB)),
+                       key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+                       reverse=True):
+        if os.path.isdir(os.path.join(cand, "mnemosyne")):
+            _sp_path = cand
+            break
+    if _sp_path:
+        logger.debug("mnemosyne fallback site-packages: %s", _sp_path)
     else:
-        logger.debug("mnemosyne CLI fallback unavailable (binary not found)")
-    return path
+        logger.debug("mnemosyne fallback unavailable (site-packages not found)")
+    return _sp_path
 
 
-def _cli_store(content: str, source: str, importance: float) -> Optional[str]:
-    """Write one lesson through the CLI. Returns its memory_id, or None."""
-    binary = find_cli()
-    if not binary:
+def _load_backend() -> Any:
+    """Import mnemosyne once and resolve the DB. Returns (Mnemosyne, db_path,
+    bank), or None when unavailable. The result — including failure — is cached
+    so a broken environment costs one attempt, not one per lesson."""
+    global _im_ready
+    if _im_ready is not _UNSET:
+        return _im_ready
+    _im_ready = None
+    sp = find_packages()
+    if not sp:
         return None
-    env = dict(os.environ)
-    env[CLI_SCOPE_ENV] = "global"
+    if sp not in sys.path:
+        sys.path.append(sp)
     try:
-        # List form, no shell: content is never interpreted by a shell.
-        proc = subprocess.run(
-            [binary, "store", content, source, f"{float(importance):.3f}"],
-            capture_output=True, text=True, timeout=CLI_TIMEOUT_S, env=env,
+        from mnemosyne.core.memory import Mnemosyne  # noqa: PLC0415
+        from mnemosyne.core.banks import BankManager  # noqa: PLC0415
+        # Same resolution order as mnemosyne/cli.py:_default_data_dir.
+        data_dir = os.environ.get("MNEMOSYNE_DATA_DIR")
+        if not data_dir:
+            hermes_home = os.environ.get("HERMES_HOME")
+            data_dir = (str(Path(hermes_home).expanduser() / "mnemosyne" / "data")
+                        if hermes_home
+                        else str(Path.home() / ".hermes" / "mnemosyne" / "data"))
+        bank = (os.environ.get("MNEMOSYNE_BANK") or "default").strip()
+        db_path = str(BankManager(Path(data_dir)).get_bank_db_path(bank))
+    except Exception as exc:  # noqa: BLE001 — never take the gateway down
+        logger.warning("mnemosyne fallback unusable: %s", type(exc).__name__)
+        return None
+    _im_ready = (Mnemosyne, db_path, bank)
+    logger.debug("mnemosyne fallback ready: db=%s bank=%s", db_path, bank)
+    return _im_ready
+
+
+def _memory_store(content: str, source: str, importance: float) -> Optional[str]:
+    """Write one lesson in-process. Returns its memory_id, or None."""
+    ready = _load_backend()
+    if not ready:
+        return None
+    content = (content or "").strip()
+    if not content:
+        return None
+    Mnemosyne, db_path, bank = ready
+    try:
+        # A fresh handle per write, like one CLI run: no long-lived connection
+        # is parked inside the gateway process.
+        mem = Mnemosyne(db_path=db_path, bank=bank)
+        memory_id = mem.remember(
+            content,
+            source=source,
+            importance=max(0.0, min(1.0, float(importance))),
+            scope=LESSON_SCOPE,
+            extract_entities=True,
         )
-    except Exception as exc:
-        logger.debug("mnemosyne CLI store failed: %s", type(exc).__name__)
+    except Exception as exc:  # noqa: BLE001 — a bad write must not kill the hook
+        logger.warning("mnemosyne in-process store failed: %s", type(exc).__name__)
         return None
-    out = (proc.stdout or "") + (proc.stderr or "")
-    if proc.returncode != 0:
-        # Bounded: never echo the whole body, and never echo env/credentials.
-        logger.warning("mnemosyne CLI store rc=%s: %s", proc.returncode, out.strip()[:200])
-        return None
-    match = re.search(r"Stored:\s*([0-9a-fA-F]+)", out)
-    if not match:
-        logger.debug("mnemosyne CLI store returned no id")
-        return None
-    logger.info("recorded lesson via mnemosyne CLI: %s", match.group(1))
-    return match.group(1)
+    if isinstance(memory_id, str) and memory_id:
+        logger.info("recorded lesson via mnemosyne fallback: %s", memory_id)
+        return memory_id
+    logger.debug("mnemosyne in-process store returned no id")
+    return None
 
 
 def write_path(ctx: Any) -> str:
-    """Which write path exists here: ``provider`` | ``cli`` | ``none``."""
+    """Which write path exists here: ``provider`` | ``fallback`` | ``none``."""
     if available(ctx):
         return "provider"
-    return "cli" if find_cli() else "none"
+    return "fallback" if _load_backend() else "none"
 
 
 def remember_ex(ctx: Any, content: str, importance: float = 0.5,
@@ -204,9 +239,10 @@ def remember_ex(ctx: Any, content: str, importance: float = 0.5,
     # exception means the store is reachable but unhappy — keep the original
     # contract and surface it instead of silently writing elsewhere.
     if provider_status == STATUS_ABSENT:
-        cli_id = _cli_store(content, source, max(0.0, min(1.0, float(importance))))
-        if cli_id:
-            return cli_id, STATUS_SAVED
+        fallback_id = _memory_store(content, source,
+                                    max(0.0, min(1.0, float(importance))))
+        if fallback_id:
+            return fallback_id, STATUS_SAVED
     return None, provider_status
 
 

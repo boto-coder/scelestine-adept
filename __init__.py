@@ -128,8 +128,8 @@ def _handle_remember(args: Dict[str, Any], **kwargs: Any) -> str:
     if not memory_id:
         if status == store.STATUS_ABSENT:
             return _err(
-                "Mnemosyne backend not loaded in this context and CLI "
-                "fallback unavailable; lesson NOT stored",
+                "Mnemosyne backend not loaded in this context and the "
+                "in-process fallback is unavailable; lesson NOT stored",
                 lesson=lesson[:120], status=status,
             )
         return _err("Mnemosyne write failed; lesson not stored",
@@ -336,9 +336,10 @@ def _warn_backend_absent(where: str) -> None:
         return
     _BACKEND_ABSENT_WARNED = True
     logger.warning(
-        "mnemosyne storage unavailable in this context: no provider and no CLI "
-        "binary (skip_memory fork, e.g. background_review or curator). "
-        "Auto-record skipped, lesson NOT stored. Where: %s", where,
+        "mnemosyne storage unavailable in this context: no provider and the "
+        "in-process fallback is unavailable too (skip_memory fork, e.g. "
+        "background_review or curator). Auto-record skipped, lesson NOT "
+        "stored. Where: %s", where,
     )
 
 
