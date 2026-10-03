@@ -86,9 +86,11 @@ def available(ctx: Any) -> bool:
 # --- in-process fallback ----------------------------------------------------
 # skip_memory forks (background_review, curator) never bind the mnemosyne
 # provider, so ctx.dispatch_tool("mnemosyne_remember") returns "Unknown tool".
-# The provider is not importable here by default (ModuleNotFoundError,
-# verified), so add its venv site-packages to sys.path and call Mnemosyne
-# directly. Properties that were verified before choosing this path:
+# Call Mnemosyne directly instead. Import order, both verified:
+#   1. a plain `import mnemosyne` — the gateway venv already ships it;
+#   2. ModuleNotFoundError means a slimmer interpreter, so append the venv
+#      site-packages that carry mnemosyne and import again.
+# Properties that were verified before choosing this path:
 #   * same DB as the provider (both reported 35 working memories at
 #     ~/.hermes/mnemosyne/data/mnemosyne.db) and it embeds on write
 #     (store -> recall returned the row, score 0.551);
@@ -133,14 +135,20 @@ def _load_backend() -> Any:
     if _im_ready is not _UNSET:
         return _im_ready
     _im_ready = None
-    sp = find_packages()
-    if not sp:
-        return None
-    if sp not in sys.path:
-        sys.path.append(sp)
     try:
-        from mnemosyne.core.memory import Mnemosyne  # noqa: PLC0415
-        from mnemosyne.core.banks import BankManager  # noqa: PLC0415
+        # 1) plain import — the gateway venv already ships mnemosyne.
+        try:
+            from mnemosyne.core.memory import Mnemosyne  # noqa: PLC0415
+            from mnemosyne.core.banks import BankManager  # noqa: PLC0415
+        except ModuleNotFoundError:
+            # 2) slimmer interpreter: append the site-packages that ship it.
+            sp = find_packages()
+            if not sp:
+                raise
+            if sp not in sys.path:
+                sys.path.append(sp)
+            from mnemosyne.core.memory import Mnemosyne  # noqa: PLC0415
+            from mnemosyne.core.banks import BankManager  # noqa: PLC0415
         # Same resolution order as mnemosyne/cli.py:_default_data_dir.
         data_dir = os.environ.get("MNEMOSYNE_DATA_DIR")
         if not data_dir:
