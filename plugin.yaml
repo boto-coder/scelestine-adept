@@ -1,0 +1,16 @@
+name: scelestine-adept
+version: 0.1.0
+description: "Self-learning for Scelestine: records lessons, recalls and ranks them for the current task, and distills standing behaviors into SOUL.md. Storage is Mnemosyne only (no JSONL, no local lesson files). Re-ranks recall with a Jev System One call and fails open on every error path."
+author: "boto-coder"
+requires_hermes: ">=0.21.0"
+hooks:
+  - pre_llm_call
+  - post_tool_call
+provides_hooks:
+  - pre_llm_call
+  - post_tool_call
+provides_tools:
+  - adept_remember
+  - adept_recall
+  - adept_reflect
+  - adept_review
