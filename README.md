@@ -103,6 +103,57 @@ A Jev outage, a missing credential, or a Mnemosyne timeout all degrade to
 
 ---
 
+## Storage backends and the `skip_memory` fallback
+
+Mnemosyne is reached two ways, in this order:
+
+1. **Provider** — `ctx.dispatch_tool("mnemosyne_remember")`. The normal path.
+2. **CLI** — a subprocess call to the `mnemosyne` binary. Used only when the
+   provider answers `Unknown tool`.
+
+`store.write_path()` reports which path exists in the current context:
+
+| Verdict | Meaning |
+|---|---|
+| `provider` | the memory provider is bound; normal write |
+| `cli` | provider absent, binary found; same DB via subprocess |
+| `none` | nothing can store; the lesson is dropped, loudly |
+
+### Why some contexts have no provider
+
+Hermes builds the memory provider inside `agent_init.py::_init_memory`, behind
+`elif not skip_memory:`. Two contexts pass `skip_memory: True`:
+
+* `agent/background_review.py` — hard-codes it. The docstring explains the
+  reason: a provider scoped to the parent session would leak the harness prompt
+  into the user's real memory namespace;
+* `agent/curator.py`.
+
+In those contexts `mnemosyne_remember` never reaches the tool registry, so a
+write answers `Unknown tool`. This plugin does **not** re-register the provider
+there — that would reopen the leak. It writes through the CLI instead, which
+touches the same database (`~/.hermes/mnemosyne/data/mnemosyne.db`) and embeds
+on write. The CLI path is write-only: it never reads the fork's context, so the
+leak stays shut.
+
+Three guards keep it honest:
+
+* the CLI runs with `MNEMOSYNE_DEFAULT_SCOPE=global`. Its own default is
+  `session`, which would hide the lesson from every later session;
+* when the verdict is `none`, the Jev gate is skipped — no SystemOne request is
+  spent on a lesson that cannot be stored;
+* `backend_absent` is logged once per process as a WARNING, never as
+  `auto-recorded ... : None`.
+
+### Binary discovery
+
+`shutil.which("mnemosyne")` first, then a glob over
+`~/.hermes/installs/*/environments/*/venv/bin/mnemosyne`. The gateway PATH does
+not carry that venv bin, so the glob is required. If neither resolves, the
+verdict is `none` and the failure is reported instead of hidden.
+
+---
+
 ## Configuration
 
 Set under `plugins.config.scelestine-adept` in `~/.hermes/config.yaml`:

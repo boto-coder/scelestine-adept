@@ -121,12 +121,19 @@ def _handle_remember(args: Dict[str, Any], **kwargs: Any) -> str:
 
     why = str(args.get("why") or "").strip()
     content = f"{lesson}\nContext: {why}" if why else lesson
-    memory_id = store.remember(
+    memory_id, status = store.remember_ex(
         ctx, content, importance=importance,
         metadata={"source_tool": "adept_remember"},
     )
     if not memory_id:
-        return _err("Mnemosyne write failed; lesson not stored", lesson=lesson[:120])
+        if status == store.STATUS_ABSENT:
+            return _err(
+                "Mnemosyne backend not loaded in this context and CLI "
+                "fallback unavailable; lesson NOT stored",
+                lesson=lesson[:120], status=status,
+            )
+        return _err("Mnemosyne write failed; lesson not stored",
+                    lesson=lesson[:120], status=status)
 
     return _ok({
         "saved": True,
@@ -318,6 +325,23 @@ def _failure(status: Any, error_type: Any, error_message: Any,
     return False
 
 
+_BACKEND_ABSENT_WARNED = False
+
+
+def _warn_backend_absent(where: str) -> None:
+    """One loud line per process. An absent backend must never look like a success."""
+    global _BACKEND_ABSENT_WARNED
+    if _BACKEND_ABSENT_WARNED:
+        logger.debug("mnemosyne backend absent (already reported) in %s", where)
+        return
+    _BACKEND_ABSENT_WARNED = True
+    logger.warning(
+        "mnemosyne storage unavailable in this context: no provider and no CLI "
+        "binary (skip_memory fork, e.g. background_review or curator). "
+        "Auto-record skipped, lesson NOT stored. Where: %s", where,
+    )
+
+
 def _handle_failed_tool(tool_name: str, error_text: str) -> None:
     """auto_record: decide whether this failure is worth a lesson, then store it."""
     ctx = _CTX
@@ -326,6 +350,13 @@ def _handle_failed_tool(tool_name: str, error_text: str) -> None:
     if not bool(_cfg(ctx, "auto_record", True)):
         return
     if any(tool_name.startswith(p) for p in SKIP_PREFIXES):
+        return
+
+    # Prove a write path exists BEFORE spending a SystemOne call on a lesson
+    # that cannot be stored. Lazy probe, never at plugin load: PluginManager
+    # runs register() before _init_memory binds the provider.
+    if store.write_path(ctx) == "none":
+        _warn_backend_absent(f"post_tool_call/{tool_name}")
         return
 
     digest = hashlib.sha256(f"{tool_name}|{error_text}".encode()).hexdigest()[:16]
@@ -350,11 +381,18 @@ def _handle_failed_tool(tool_name: str, error_text: str) -> None:
     if worth is None or worth < float(_cfg(ctx, "auto_record_floor", 0.60)):
         return
 
-    memory_id = store.remember(
+    memory_id, status = store.remember_ex(
         ctx, candidate, importance=0.45, source="auto_record",
         metadata={"tool": tool_name},
     )
-    logger.info("auto-recorded lesson from %s failure: %s", tool_name, memory_id)
+    if status == store.STATUS_SAVED:
+        logger.info("auto-recorded lesson from %s failure: %s", tool_name, memory_id)
+    elif status == store.STATUS_ABSENT:
+        # write_path() said a path existed, then it vanished: report it.
+        _warn_backend_absent(f"post_tool_call/{tool_name}")
+    else:
+        logger.warning("auto-recorded lesson from %s failure was NOT stored "
+                       "(write error)", tool_name)
 
 
 def _on_tool(tool_name: str, args: Dict[str, Any], result: Any,
