@@ -19,11 +19,23 @@ from . import decision, identity, recall, store
 
 logger = logging.getLogger("plugins.scelestine-adept.review")
 
-REVIEW_QUERY = ("recurring lesson from past work: a mistake that repeated, a "
-                "correction the user gave more than once, or a fix that kept "
-                "being needed")
+# Kept only as a fallback pool when the direct listing is empty. NOT a good
+# primary: an abstract question scores fts=0 against every lesson, so the
+# relevance cutoff drops them all (measured: 18 found, 0 kept).
+REVIEW_QUERY = "after a tool failure, retry differently"
 REVIEW_SHORTLIST = 20
-REVIEW_FLOOR = 0.60
+
+# A `choice` question returns a PROBABILITY DISTRIBUTION that sums to 1.0, so
+# its scale depends on roster size: the same lesson scores 0.62 among 3 options
+# and 0.25 among 17. An absolute floor is therefore meaningless — 0.60 was
+# unreachable for any roster above ~2 and silently promoted nothing.
+#
+# The scale-free measure is LIFT = probability * roster size. 1.0 is "no better
+# than uniform"; higher means the model actively preferred it. Measured on a
+# real pool of 7 distinct lessons: the winner scored lift 5.11, the runner-up
+# 1.12. A floor of 1.5 keeps the clear winner, drops the noise, and needs no
+# magic constant tied to roster size.
+REVIEW_MIN_LIFT = 1.5
 
 LEGEND = (
     "Promote only when the lesson applies broadly to future work and has shown "
@@ -32,9 +44,13 @@ LEGEND = (
 )
 
 
-def score_lessons(lessons: List[Dict[str, Any]], floor: float = REVIEW_FLOOR
-                  ) -> List[Dict[str, Any]]:
-    """Stage 1 (Mnemosyne) + stage 2 (Jev), with a promotion rubric."""
+def score_lessons(lessons: List[Dict[str, Any]],
+                  min_lift: float = REVIEW_MIN_LIFT) -> List[Dict[str, Any]]:
+    """Stage 1 (Mnemosyne) + stage 2 (Jev), with a promotion rubric.
+
+    Keeps lessons whose lift clears ``min_lift``. ``lift`` is
+    ``score * len(options)`` and is stored on each row alongside ``score``.
+    """
     if len(lessons) < 2:
         return []
     options = {
@@ -54,22 +70,29 @@ def score_lessons(lessons: List[Dict[str, Any]], floor: float = REVIEW_FLOOR
         logger.debug("review scoring failed: %s", type(exc).__name__)
         scores = []
 
+    roster = max(1, len(options))
     by_id = {row.get("id"): row for row in lessons}
     out: List[Dict[str, Any]] = []
     for key, score in scores:
         row = by_id.get(key)
         if row is None:
             continue
+        value = float(score)
         enriched = dict(row)
-        enriched["score"] = round(float(score), 4)
+        enriched["score"] = round(value, 4)
+        enriched["lift"] = round(value * roster, 3)
         out.append(enriched)
-    out.sort(key=lambda r: -r["score"])
-    return [r for r in out if r["score"] >= floor]
+    out.sort(key=lambda r: -r["lift"])
+    return [r for r in out if r["lift"] >= min_lift]
 
 
 def _rule_from_lesson(text: str) -> str:
     """Turn a lesson into a short imperative rule."""
     rule = " ".join(str(text).split())
+    # Drop the storage marker so it never leaks into SOUL.md.
+    marker = store.LESSON_MARKER
+    if rule.upper().startswith(marker):
+        rule = rule[len(marker):].strip()
     if len(rule) > 380:
         rule = rule[:377].rstrip() + "..."
     return rule
@@ -105,10 +128,15 @@ def run(ctx: Any, limit: int = 2, hours: int = 24, dry_run: bool = False
         report["error"] = "limit is 0; nothing to promote"
         return report
 
-    lessons = recall.shortlist(
-        ctx, REVIEW_QUERY, limit=REVIEW_SHORTLIST,
-        temporal_weight=min(0.9, max(0.1, hours / 24.0)),
-    )
+    lessons = store.recent_lessons(ctx, hours=hours, limit=REVIEW_SHORTLIST)
+    if not lessons:
+        # Direct listing can legitimately be empty (a context that sees no
+        # rows). Fall back to a keyword-rich recall query, which does score
+        # against lesson text.
+        lessons = recall.shortlist(
+            ctx, REVIEW_QUERY, limit=REVIEW_SHORTLIST,
+            temporal_weight=min(0.9, max(0.1, hours / 24.0)),
+        )
     if not lessons:
         report["error"] = "no lessons found (Mnemosyne returned nothing)"
         return report
@@ -131,6 +159,7 @@ def run(ctx: Any, limit: int = 2, hours: int = 24, dry_run: bool = False
         content = str(row.get("content") or "").strip()
         rule = _rule_from_lesson(content)
         entry = {"id": memory_id, "score": row.get("score"),
+                 "lift": row.get("lift"),
                  "content": content[:200], "rule": rule}
 
         allowed, reason = identity.gate(rule)

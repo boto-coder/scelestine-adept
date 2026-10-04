@@ -12,10 +12,12 @@ returns None on any failure and never raises into a hook.
 
 from __future__ import annotations
 
+import datetime as _dt
 import glob
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -28,6 +30,15 @@ BEHAVIOR_CATEGORY = "behavior"
 
 # Lessons are global so they recall in any later session, not just this one.
 LESSON_SCOPE = "global"
+
+# Provenance tag on every lesson this plugin writes. The nightly review reads
+# rows back by this tag, so it must be stable.
+LESSON_SOURCE = "auto_record"
+
+# Written at the head of every lesson. Makes a lesson recognisable even when a
+# row comes back without its source tag, and gives recall an exact token to
+# match on.
+LESSON_MARKER = "LESSON:"
 
 # Write outcomes. Three-way on purpose: a missing backend is a different
 # condition from a failed write, and it must never be reported as success.
@@ -196,6 +207,40 @@ def _memory_store(content: str, source: str, importance: float) -> Optional[str]
     return None
 
 
+def lesson_signature(text: str) -> str:
+    """A stable identity for a lesson, so repeats can be collapsed.
+
+    Failure lessons are mostly identical boilerplate, so a day of tool errors
+    can leave 17 rows describing only 7 real lessons. Deduplicating on this
+    signature stops the review promoting the same rule several times, and stops
+    one lesson consuming the whole promotion budget.
+
+    The volatile part is the detail after the first colon and any trailing
+    exit/status number, so both are dropped.
+    """
+    body = " ".join(str(text or "").split())
+    if body.upper().startswith(LESSON_MARKER):
+        body = body[len(LESSON_MARKER):].strip()
+    body = body.split(":", 1)[0]
+    body = re.sub(r"\b(exit|status|code)\s*\d+\b", " ", body, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", body).strip().lower()
+
+
+def lesson_text(text: str) -> str:
+    """Prefix a lesson with the marker recall can match exactly.
+
+    Without this the stored rows are free prose, so the only way to find them
+    later is a semantic question — and this engine ranks mostly on keyword
+    overlap, which an abstract question does not provide.
+    """
+    body = " ".join(str(text or "").split())
+    if not body:
+        return ""
+    if body.upper().startswith(LESSON_MARKER):
+        return body
+    return f"{LESSON_MARKER} {body}"
+
+
 def write_path(ctx: Any) -> str:
     """Which write path exists here: ``provider`` | ``fallback`` | ``none``."""
     if available(ctx):
@@ -204,13 +249,13 @@ def write_path(ctx: Any) -> str:
 
 
 def remember_ex(ctx: Any, content: str, importance: float = 0.5,
-                source: str = "lesson", metadata: Optional[Dict[str, Any]] = None
-                ) -> Any:
+                source: str = LESSON_SOURCE,
+                metadata: Optional[Dict[str, Any]] = None) -> Any:
     """Store one lesson. Returns ``(memory_id_or_None, status)``."""
     if ctx is None:
         # No context means the plugin is not registered here: never write.
         return None, STATUS_FAILED
-    content = (content or "").strip()
+    content = lesson_text(content)
     if not content:
         return None, STATUS_FAILED
     args: Dict[str, Any] = {
@@ -309,8 +354,8 @@ def _content_of(row: Dict[str, Any]) -> str:
 
 
 def remember(ctx: Any, content: str, importance: float = 0.5,
-             source: str = "lesson", metadata: Optional[Dict[str, Any]] = None
-             ) -> Optional[str]:
+             source: str = LESSON_SOURCE,
+             metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Store one lesson. Returns its memory_id, or None.
 
     Kept for existing callers. Use :func:`remember_ex` when the caller must tell
@@ -338,23 +383,237 @@ def recall(ctx: Any, query: str, limit: int = 12,
     return out
 
 
+def _parse_ts(value: Any) -> Optional[_dt.datetime]:
+    """Best-effort ISO parse. Naive stamps are treated as UTC."""
+    if not value:
+        return None
+    try:
+        text = str(value).strip().replace("Z", "+00:00")
+        stamp = _dt.datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=_dt.timezone.utc)
+    return stamp
+
+
+def _lesson_rows(rows: List[Dict[str, Any]], source: str,
+                 since: Optional[_dt.datetime]) -> List[Dict[str, Any]]:
+    """Keep rows that are lessons, newest first.
+
+    A row counts as a lesson when its ``source`` matches, or when the tag is
+    absent and the content carries the ``LESSON_MARKER`` prefix that
+    :func:`lesson_text` writes. Ordering is by timestamp descending, so the
+    nightly review always looks at the most recent work first.
+    """
+    marker = LESSON_MARKER.lower()
+    picked: List[Dict[str, Any]] = []
+    for row in rows:
+        text = _content_of(row)
+        if not text:
+            continue
+        tag = str(row.get("source") or "").strip().lower()
+        is_lesson = (tag == source.lower()) or (not tag and marker in text.lower())
+        if not is_lesson:
+            continue
+        if since is not None:
+            stamp = _parse_ts(row.get("timestamp") or row.get("created_at"))
+            if stamp is not None and stamp < since:
+                continue
+        picked.append({
+            "id": _id_of(row),
+            "content": text,
+            "source": row.get("source"),
+            "timestamp": row.get("timestamp"),
+            "importance": row.get("importance"),
+            "row": row,
+        })
+    picked.sort(key=lambda r: str(r.get("timestamp") or ""), reverse=True)
+    return picked
+
+
+def recent_lessons(ctx: Any, hours: int = 24, limit: int = 20,
+                   source: str = LESSON_SOURCE) -> List[Dict[str, Any]]:
+    """The distinct lessons recorded in the last ``hours``, newest first.
+
+    Deliberately NOT a semantic search. Recall here ranks mostly on keyword
+    overlap, so an abstract question ("which lesson deserves a standing
+    behaviour?") scores ``fts=0`` against every row and the relevance cutoff
+    drops all of them — measured: 18 lessons found, 0 kept. Recency plus
+    provenance is what the review actually needs, and it is deterministic.
+
+    Rows are collapsed by :func:`lesson_signature` and the newest row of each
+    signature wins, so repeats of one lesson cannot crowd out the rest.
+
+    Returns [] on any failure, like every other reader here.
+    """
+    pool = get_all_memories(ctx)
+    if not pool:
+        return []
+    since = None
+    if hours and int(hours) > 0:
+        since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=int(hours))
+    rows = _lesson_rows(pool, source, since)
+    seen: set = set()
+    distinct: List[Dict[str, Any]] = []
+    for row in rows:          # already newest-first
+        sig = lesson_signature(row.get("content", ""))
+        if sig and sig in seen:
+            continue
+        if sig:
+            seen.add(sig)
+        distinct.append(row)
+    return distinct[:max(0, int(limit))]
+
+
+def get_all_memories(ctx: Any) -> List[Dict[str, Any]]:
+    """Every working row this context can see, or [] on failure.
+
+    ``mnemosyne_stats`` is the probe because the provider registers its whole
+    tool bundle in one loop. There is no provider tool that lists raw rows, so
+    an in-process read backs this one — write-only elsewhere, read here.
+    """
+    if ctx is not None and available(ctx):
+        payload = dispatch(ctx, "mnemosyne_recall",
+                           {"query": LESSON_MARKER, "limit": 50})
+        rows = _rows(payload)
+        if rows:
+            return rows
+    return _memory_list()
+
+
+def _memory_list() -> List[Dict[str, Any]]:
+    """In-process listing for contexts where no provider tool exposes rows."""
+    ready = _load_backend()
+    if not ready:
+        return []
+    Mnemosyne, db_path, bank = ready
+    try:
+        mem = Mnemosyne(db_path=db_path, bank=bank)
+        rows = mem.get_all_memories()
+    except Exception as exc:  # noqa: BLE001 — a bad read must not kill the caller
+        logger.warning("mnemosyne in-process read failed: %s", type(exc).__name__)
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+# --- in-process canonical slots -------------------------------------------
+# Canonical facts live in their own table (canonical_facts), keyed by
+# (owner_id, category, name). The provider derives owner_id from the active
+# Hermes profile and the default profile maps to "default" — the same value
+# the provider tools would use, so a slot written here is visible to them.
+CANONICAL_OWNER = "default"
+
+
+def _canonical_mod() -> Any:
+    """Import mnemosyne.core.canonical, appending site-packages if needed."""
+    try:
+        from mnemosyne.core import canonical  # noqa: PLC0415
+        return canonical
+    except ModuleNotFoundError:
+        sp = find_packages()
+        if not sp:
+            return None
+        if sp not in sys.path:
+            sys.path.append(sp)
+        try:
+            from mnemosyne.core import canonical  # noqa: PLC0415
+            return canonical
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("canonical module unavailable: %s", type(exc).__name__)
+            return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("canonical module unavailable: %s", type(exc).__name__)
+        return None
+
+
+def _canonical_db() -> Optional[Path]:
+    """The bank DB path, resolved the same way as the write fallback."""
+    ready = _load_backend()
+    if not ready:
+        return None
+    return Path(ready[1])
+
+
+def _memory_canonical_put(name: str, body: str, category: str) -> bool:
+    mod = _canonical_mod()
+    db = _canonical_db()
+    if mod is None or db is None:
+        return False
+    try:
+        row = mod.remember_canonical(CANONICAL_OWNER, category, name, body,
+                                     source="scelestine-adept", db_path=db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("canonical write failed: %s", type(exc).__name__)
+        return False
+    if isinstance(row, dict) and not _error_text(row):
+        logger.info("canonical slot written in-process: %s/%s", category, name)
+        return True
+    return False
+
+
+def _memory_canonical_list(category: str) -> List[Dict[str, Any]]:
+    mod = _canonical_mod()
+    db = _canonical_db()
+    if mod is None or db is None:
+        return []
+    try:
+        store = mod.CanonicalStore(db_path=db)
+        rows = store.list(CANONICAL_OWNER, category=category)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("canonical read failed: %s", type(exc).__name__)
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _memory_canonical_retire(name: str, category: str) -> bool:
+    mod = _canonical_mod()
+    db = _canonical_db()
+    if mod is None or db is None:
+        return False
+    try:
+        return bool(mod.forget_canonical(CANONICAL_OWNER, category, name,
+                                         db_path=db))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("canonical retire failed: %s", type(exc).__name__)
+        return False
+
+
+
 def canonical_put(ctx: Any, name: str, body: str,
                   category: str = BEHAVIOR_CATEGORY) -> bool:
-    """Write one canonical behavior slot. A new value supersedes the old one."""
+    """Write one canonical behavior slot. A new value supersedes the old one.
+
+    Returns True only when a slot was really written. The old version returned
+    ``payload is not None``, so an ``{"error": "Unknown tool"}`` reply counted
+    as success — which is why a promoted behavior never reached SOUL.md.
+    """
     body = (body or "").strip()
     if not name or not body:
         return False
-    payload = dispatch(ctx, "mnemosyne_remember_canonical",
-                       {"category": category, "name": name, "body": body})
-    return payload is not None
+    if ctx is not None and available(ctx):
+        payload = dispatch(ctx, "mnemosyne_remember_canonical",
+                           {"category": category, "name": name, "body": body})
+        if payload is not None and not _error_text(payload):
+            return True
+    return _memory_canonical_put(name, body, category)
 
 
 def canonical_list(ctx: Any, category: str = BEHAVIOR_CATEGORY
                    ) -> List[Dict[str, Any]]:
     """Read every current slot in a canonical group."""
-    payload = dispatch(ctx, "mnemosyne_recall_canonical", {"category": category})
     out: List[Dict[str, Any]] = []
-    for row in _rows(payload):
+    if ctx is not None and available(ctx):
+        payload = dispatch(ctx, "mnemosyne_recall_canonical",
+                           {"category": category})
+        for row in _rows(payload):
+            name = str(row.get("name") or "").strip()
+            body = _content_of(row)
+            if name and body:
+                out.append({"name": name, "content": body})
+        if out:
+            return out
+    for row in _memory_canonical_list(category):
         name = str(row.get("name") or "").strip()
         body = _content_of(row)
         if name and body:
@@ -365,19 +624,26 @@ def canonical_list(ctx: Any, category: str = BEHAVIOR_CATEGORY
 def canonical_retire(ctx: Any, name: str,
                      category: str = BEHAVIOR_CATEGORY) -> bool:
     """Stamp a slot as history. Nothing is deleted."""
-    payload = dispatch(ctx, "mnemosyne_forget_canonical",
-                       {"category": category, "name": name})
-    return payload is not None
+    if ctx is not None and available(ctx):
+        payload = dispatch(ctx, "mnemosyne_forget_canonical",
+                           {"category": category, "name": name})
+        if payload is not None and not _error_text(payload):
+            return True
+    return _memory_canonical_retire(name, category)
 
 
 def persona_promote(ctx: Any, memory_id: str, reason: str = "") -> bool:
     """Move a lesson into the L3 persona store so it is reinforced over time."""
     if not memory_id:
         return False
-    args: Dict[str, Any] = {"memory_id": memory_id, "tier": "long_term"}
-    if reason:
-        args["reason"] = reason[:400]
-    return dispatch(ctx, "mnemosyne_persona_promote", args) is not None
+    if ctx is not None and available(ctx):
+        args: Dict[str, Any] = {"memory_id": memory_id, "tier": "long_term"}
+        if reason:
+            args["reason"] = reason[:400]
+        payload = dispatch(ctx, "mnemosyne_persona_promote", args)
+        if payload is not None and not _error_text(payload):
+            return True
+    return False
 
 
 def graph_link(ctx: Any, source_id: str, target_id: str,
