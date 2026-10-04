@@ -53,22 +53,25 @@ DEFAULT_SKIP = ("cron", "background", "subagent")
 
 MAX_LESSON_CHARS = 240
 
-# Gate floor for "is this a reusable lesson?". Measured on this system, 3 runs
-# each over 6 genuine corrections and 6 one-off remarks (the Jev `noul` answer
-# for one text varies by ~0.04 between runs):
+# Gate floor for "is this a reusable lesson?". Measured on this system, two
+# independent runs of 3 samples each over 6 genuine corrections and 6 one-off
+# remarks (the Jev `noul` answer for one text varies by at most 0.04 between
+# samples, so these figures are stable):
 #
-#   genuine corrections  mean 0.524   range 0.34 - 0.82
-#   one-off remarks      mean 0.289   range 0.21 - 0.42
+#   genuine corrections  mean 0.524   range 0.33 - 0.81
+#   one-off remarks      mean 0.288   range 0.20 - 0.42
 #
-#   0.60 (the auto_record default) kept only  6/18  -> two thirds of real
-#          corrections were lost, and caught no more remarks than 0.45
-#   0.40                            kept 11/18, dropped 17/18 remarks
-#   0.35                            kept 16/18, dropped 15/18 remarks
-#   0.30                            kept 18/18, dropped only 10/18 remarks
+#   floor    lessons kept (run 1 / run 2)   remarks dropped
+#   0.60     6/18  /  6/18                  18/18   <- the auto_record default
+#   0.40    11/18  / 12/18                  17/18
+#   0.35    16/18  / 15/18                  15/18
+#   0.30    18/18  / 18/18                  10/18
 #
-# 0.35 is the best trade: it keeps almost every real correction while still
-# rejecting most one-off remarks. The failure path keeps its own higher 0.60
-# because a tool error is boilerplate and the bar there should be stricter.
+# The auto_record default of 0.60 threw away two thirds of genuine corrections
+# and caught no more remarks than 0.45 did. 0.35 keeps ~85% of real corrections
+# while still rejecting ~85% of one-off remarks, and it held across both runs.
+# The failure path keeps its own higher 0.60: a tool error is boilerplate, so
+# the bar there should be stricter.
 DEFAULT_FLOOR = 0.35
 
 
