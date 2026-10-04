@@ -71,7 +71,7 @@ ordering, auto-record skips its quality gate, and nothing errors.
 | Tool | What it does |
 |---|---|
 | `adept_remember` | Record one reusable lesson. Detects duplicates and reports them instead of saving twice. Estimates importance with a Jev call when you do not supply it. |
-| `adept_recall` | Rank past lessons for a task: Mnemosyne hybrid retrieval → Jev re-rank → top 3 above the confidence floor. |
+| `adept_recall` | Rank past lessons for a task: Mnemosyne hybrid retrieval → Jev re-rank → top 3 above the lift floor. |
 | `adept_reflect` | Distill one standing behavior into a `SOUL.md` managed slot, through a safety gate. Optionally promotes a source memory into the long-term persona store. |
 | `adept_review` | Nightly review entry point. Scores recent lessons against a promotion rubric, promotes the winners, enforces the behavior cap. Supports `dry_run`. |
 
@@ -94,12 +94,29 @@ rather than risk swallowing text.
 
 | Hook | Direction | Behaviour |
 |---|---|---|
-| `pre_llm_call` | injects | Appends a `LESSONS FROM PAST WORK` block with the top 3 ranked lessons. Skips short messages, slash commands, and any platform in `skip_platforms`. |
+| `pre_llm_call` | injects + records | Appends a `LESSONS FROM PAST WORK` block with the top 3 ranked lessons, and records a **user correction** when the turn contains one. Skips short messages, slash commands, and any platform in `skip_platforms`. |
 | `post_tool_call` | observes | On a detected tool failure, asks Jev whether the failure is a reusable lesson and records it if it clears the floor. The return value is ignored — it is an observer only. |
 
 Every hook body is wrapped: any exception is logged and the turn continues.
 A Jev outage, a missing credential, or a Mnemosyne timeout all degrade to
 "nothing is injected", never to a blocked turn.
+
+### What it learns from
+
+| Source | Route | Stored as |
+|---|---|---|
+| A tool failure | `post_tool_call` | `After a <tool> failure, retry differently: ...` |
+| A user correction | `pre_llm_call` | `User correction: ...` |
+| A manual call | `adept_remember` / `adept_reflect` | whatever the caller passes |
+
+Both automatic routes pass a Jev gate first, so a one-off remark is not stored
+as a lesson.
+
+**Correction capture** is the higher-value route: a correction ("use patch, not
+sed") is a rule, while a tool error is usually boilerplate. Detection is a
+cheap regex pre-filter (`don't`, `instead of`, `no, ...`, `stop ...`, `never
+...`), and the Jev gate is the real filter. Most turns match nothing and cost
+no Jev call.
 
 ---
 
@@ -108,15 +125,15 @@ A Jev outage, a missing credential, or a Mnemosyne timeout all degrade to
 Mnemosyne is reached two ways, in this order:
 
 1. **Provider** — `ctx.dispatch_tool("mnemosyne_remember")`. The normal path.
-2. **CLI** — a subprocess call to the `mnemosyne` binary. Used only when the
-   provider answers `Unknown tool`.
+2. **In-process** — import the `mnemosyne` package and call it directly. Used
+   only when the provider answers `Unknown tool`.
 
 `store.write_path()` reports which path exists in the current context:
 
 | Verdict | Meaning |
 |---|---|
 | `provider` | the memory provider is bound; normal write |
-| `cli` | provider absent, binary found; same DB via subprocess |
+| `fallback` | provider absent, package importable; same DB, in-process |
 | `none` | nothing can store; the lesson is dropped, loudly |
 
 ### Why some contexts have no provider
@@ -131,26 +148,29 @@ Hermes builds the memory provider inside `agent_init.py::_init_memory`, behind
 
 In those contexts `mnemosyne_remember` never reaches the tool registry, so a
 write answers `Unknown tool`. This plugin does **not** re-register the provider
-there — that would reopen the leak. It writes through the CLI instead, which
-touches the same database (`~/.hermes/mnemosyne/data/mnemosyne.db`) and embeds
-on write. The CLI path is write-only: it never reads the fork's context, so the
-leak stays shut.
+there — that would reopen the leak. It calls Mnemosyne in-process instead,
+which touches the same database (`~/.hermes/mnemosyne/data/mnemosyne.db`) and
+embeds on write.
+
+**No subprocess is used.** The plugin imports the package and calls it, so the
+audit rule forbidding process spawning holds. Import order, both verified:
+
+1. a plain `import mnemosyne` — the gateway venv already ships it;
+2. on `ModuleNotFoundError`, append the venv site-packages that carry it and
+   import again. The path is **appended**, never prepended, so every package
+   Hermes already ships keeps its own version.
 
 Three guards keep it honest:
 
-* the CLI runs with `MNEMOSYNE_DEFAULT_SCOPE=global`. Its own default is
-  `session`, which would hide the lesson from every later session;
+* writes pass `scope="global"` explicitly. The CLI's own default is `session`,
+  which would hide the lesson from every later session;
 * when the verdict is `none`, the Jev gate is skipped — no SystemOne request is
   spent on a lesson that cannot be stored;
 * `backend_absent` is logged once per process as a WARNING, never as
   `auto-recorded ... : None`.
 
-### Binary discovery
-
-`shutil.which("mnemosyne")` first, then a glob over
-`~/.hermes/installs/*/environments/*/venv/bin/mnemosyne`. The gateway PATH does
-not carry that venv bin, so the glob is required. If neither resolves, the
-verdict is `none` and the failure is reported instead of hidden.
+Canonical slots (the standing behaviours in SOUL.md) use the same fallback
+through `mnemosyne.core.canonical`, so a promotion is not lost in a fork.
 
 ---
 
@@ -165,13 +185,30 @@ plugins:
       backend: auto              # auto | typesafe | local
       inject_top: 3              # lessons injected per turn
       shortlist: 12              # Mnemosyne candidates before re-ranking
-      confidence_floor: 0.55     # drop lessons Jev scores below this
+      inject_min_lift: 1.2       # Jev lift (score x shortlist) below this is dropped
       auto_record: true          # post_tool_call writes lessons on failure
       auto_record_floor: 0.60    # Jev gate for whether a failure is a lesson
+      learn_corrections: true    # pre_llm_call records user corrections
+      correction_floor: 0.35     # Jev gate for whether a correction is a lesson
       jev_safety_gate: true      # second-layer rule gate in adept_reflect
       min_message_chars: 20      # ignore greetings for injection
       skip_platforms: []         # e.g. ["telegram"]
 ```
+
+### Why the floors are not the same kind of number
+
+`inject_min_lift` and the review's floor cut on **lift** = `score × roster
+size`, not on the raw score. A Jev `choice` question returns a probability
+distribution summing to 1.0, so the raw score shrinks as the roster grows: the
+same correct lesson scored **0.80 with 5 candidates and 0.28 with 12**. An
+absolute floor therefore discards good matches on longer shortlists — measured:
+`"tool failure retry"` shortlisted 12 rows and an absolute 0.55 floor injected
+**none** of them. Lift is scale-free: 1.0 is uniform, higher means the model
+actively preferred it.
+
+`auto_record_floor` and `correction_floor` are different: they gate a **single**
+`noul` question ("is this a reusable lesson?"), so the number is a calibrated
+yes/no and an absolute threshold is correct there.
 
 ---
 
@@ -240,7 +277,13 @@ resolve exactly as they do at runtime.
 
 ```bash
 python3 test_scelestine.py      # 111/111 — handlers, hooks, gates, file safety
+python3 test_corrections.py     #  52/52  — correction detector + lift floor
+python3 test_review_fixes.py    #  25/25  — the three review bugs, regression
+python3 test_cli_fallback.py    #  39/39  — skip_memory write fallback
+python3 test_review_e2e.py      #   9/9   — review against the live DB
+python3 test_both_fixes_e2e.py  #   9/9   — injection + capture, live
 python3 test_live_rank.py       # live re-ranking, both backends
+python3 test_shapes.py          # Shape A vs B ranking quality
 ```
 
 What is covered:
@@ -251,11 +294,20 @@ What is covered:
 - Hook behaviour: platform skip, short-message skip, slash-command skip,
   exception swallowing, and auto-record dedupe.
 - Failure detection across the status/error/result shapes the hook contract ships.
+- **Correction capture**: the detector against 12 real corrections and 12
+  ordinary turns; the gate accepting a strong correction and rejecting a weak
+  one; dedupe; and that an ordinary message costs no Jev call.
+- **The lift floor**: a real regression case where a correct match scoring 0.28
+  on a 12-row shortlist is kept (the old absolute 0.55 floor dropped it), while
+  uniform scores are still rejected.
 - `SOUL.md` byte safety: with the managed block removed, the result equals the
   input — including after 5 consecutive rewrites, which caught a real bug where
   one newline leaked per rewrite.
 - Corrupt-marker refusal: a stray marker leaves the file untouched.
 - Live ranking shape, sort order, score range, and round-trip of option text.
+- The review bug regressions: the abstract query returning 0 rows, the
+  unreachable absolute promotion floor, and `canonical_put` reporting success
+  on an error reply.
 
 ---
 

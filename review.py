@@ -89,10 +89,14 @@ def score_lessons(lessons: List[Dict[str, Any]],
 def _rule_from_lesson(text: str) -> str:
     """Turn a lesson into a short imperative rule."""
     rule = " ".join(str(text).split())
-    # Drop the storage marker so it never leaks into SOUL.md.
+    # Drop the storage marker and the correction prefix so neither leaks into
+    # SOUL.md as prose.
     marker = store.LESSON_MARKER
     if rule.upper().startswith(marker):
         rule = rule[len(marker):].strip()
+    prefix = "User correction:"
+    if rule.lower().startswith(prefix.lower()):
+        rule = rule[len(prefix):].strip()
     if len(rule) > 380:
         rule = rule[:377].rstrip() + "..."
     return rule

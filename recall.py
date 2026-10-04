@@ -21,7 +21,14 @@ logger = logging.getLogger("plugins.scelestine-adept.recall")
 
 DEFAULT_SHORTLIST = 12
 DEFAULT_TAKE = 3
-DEFAULT_FLOOR = 0.55
+
+# Cut on LIFT (score * shortlist size), not the raw score. A `choice` question
+# returns a probability distribution summing to 1.0, so a raw score shrinks as
+# the shortlist grows: the same correct lesson scored 0.80 with 5 candidates
+# and 0.28 with 12. Measured on real queries: the correct lesson scored lift
+# 3.36, 4.00 and 1.50, while noise sat at 0.10-1.08. 1.2 keeps every true
+# match and drops the noise.
+DEFAULT_MIN_LIFT = 1.2
 
 POSITIVE = "A lesson applies when it would change how the task is done now. "
 
@@ -53,9 +60,18 @@ def shortlist(ctx: Any, query: str, limit: int = DEFAULT_SHORTLIST,
 
 def ranked(ctx: Any, query: str, limit: int = DEFAULT_TAKE,
            shortlist_size: int = DEFAULT_SHORTLIST,
-           floor: float = DEFAULT_FLOOR,
+           min_lift: float = DEFAULT_MIN_LIFT,
            temporal_weight: float = 0.0) -> List[Dict[str, Any]]:
-    """Stage 1 + 2. Returns the top `limit` rows above `floor`, best first."""
+    """Stage 1 + 2. Returns the top `limit` rows above `min_lift`, best first.
+
+    The cut is on LIFT (score * shortlist size), not the raw score. A `choice`
+    question returns a probability distribution summing to 1.0, so a raw score
+    shrinks as the shortlist grows: the SAME correct lesson scored 0.80 with 5
+    candidates and 0.28 with 12. An absolute floor therefore discards good
+    matches on longer shortlists — measured: "tool failure retry" shortlisted
+    12 rows and the old 0.55 floor injected none of them. Lift is scale-free:
+    1.0 is uniform, higher means the model actively preferred it.
+    """
     rows = shortlist(ctx, query, limit=shortlist_size,
                      temporal_weight=temporal_weight)
     if not rows:
@@ -84,22 +100,25 @@ def ranked(ctx: Any, query: str, limit: int = DEFAULT_TAKE,
         # No credential, timeout, or bad response — hand back stage 1 as-is.
         return rows[:limit]
 
+    roster = max(1, len(options))
     by_id = {row.get("id"): row for row in rows}
     out: List[Dict[str, Any]] = []
     for key, score in scores:
-        if score < floor:
+        value = float(score)
+        if value * roster < min_lift:
             continue
         row = by_id.get(key)
         if row is None:
             continue
         enriched = dict(row)
-        enriched["score"] = round(float(score), 4)
+        enriched["score"] = round(value, 4)
+        enriched["lift"] = round(value * roster, 3)
         out.append(enriched)
         if len(out) >= limit:
             break
 
-    logger.debug("recall: %d shortlisted -> %d above floor %.2f",
-                 len(rows), len(out), floor)
+    logger.debug("recall: %d shortlisted -> %d above lift %.2f",
+                 len(rows), len(out), min_lift)
     return out
 
 

@@ -5,7 +5,15 @@ standing behaviors into SOUL.md.
 
 Storage: Mnemosyne only. No JSONL, no local lesson file.
 Re-ranking: one Jev System One call per recall, fail-open.
-Surface: 4 tools, 2 hooks (pre_llm_call injects, post_tool_call auto-records).
+Surface: 4 tools, 2 hooks (pre_llm_call injects + records corrections,
+post_tool_call auto-records failures).
+
+What it learns from, automatically:
+  * a tool failure (post_tool_call)   -> "retry differently" lesson
+  * a user correction (pre_llm_call)  -> "User correction: ..." lesson
+Both pass a Jev gate first, so a one-off remark is not stored as a lesson.
+Non-failure, non-correction lessons can still be stored on demand through
+the adept_remember and adept_reflect tools.
 
 register() performs registrations only — no network calls, no file writes.
 Every hook body is wrapped so an exception is logged and the turn continues.
@@ -18,7 +26,8 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-from . import decision, identity, recall, review, schemas, store
+from . import (corrections, decision, identity, recall, review, schemas,
+               store)
 
 logger = logging.getLogger("plugins.scelestine-adept")
 
@@ -31,9 +40,11 @@ DEFAULTS: Dict[str, Any] = {
     "skip_platforms": [],           # e.g. ["telegram"]
     "min_message_chars": 20,        # ignore greetings for injection
     "inject_top": 3,                # lessons injected per turn
-    "confidence_floor": 0.55,       # Jev score below this is dropped
+    "inject_min_lift": 1.2,         # Jev lift (score * shortlist) below this is dropped
     "auto_record": True,            # post_tool_call writes a lesson on failure
     "auto_record_floor": 0.60,      # Jev gate for whether a failure is a lesson
+    "learn_corrections": True,      # pre_llm_call records user corrections
+    "correction_floor": 0.35,       # Jev gate: see corrections.DEFAULT_FLOOR
     "jev_safety_gate": True,        # second-layer rule gate in adept_reflect
     "shortlist": 12,                # Mnemosyne candidates before re-ranking
 }
@@ -164,18 +175,19 @@ def _handle_recall(args: Dict[str, Any], **kwargs: Any) -> str:
     rows = recall.ranked(
         ctx, task, limit=limit,
         shortlist_size=int(_cfg(ctx, "shortlist", 12)),
-        floor=float(_cfg(ctx, "confidence_floor", 0.55)),
+        min_lift=float(_cfg(ctx, "inject_min_lift", 1.2)),
     )
     return _ok({
         "task": task,
         "count": len(rows),
         "lessons": [
             {"memory_id": r.get("id", ""), "score": r.get("score"),
+             "lift": r.get("lift"),
              "content": r.get("content", "")[:400]}
             for r in rows
         ],
         "note": "ranked by Mnemosyne retrieval + Jev System One re-rank; "
-                "empty means no lesson cleared the floor",
+                "empty means no lesson cleared the lift floor",
     })
 
 
@@ -287,11 +299,27 @@ def _on_turn(session_id: str, user_message: Any, conversation_history: list,
         if text.startswith("/"):          # slash commands are not tasks
             return None
 
+        # A correction the user just gave is worth recording. Runs BEFORE the
+        # injection path and independently of it, so a correction is still
+        # learned on turns where no lesson was injected. Fail-open, and the
+        # regex pre-filter keeps it cheap: most turns cost no Jev call.
+        if bool(_cfg(ctx, "learn_corrections", True)):
+            try:
+                corrections.maybe_capture(
+                    ctx, text, seen=_SEEN,
+                    floor=float(_cfg(ctx, "correction_floor",
+                                     corrections.DEFAULT_FLOOR)),
+                    backend=_cfg(ctx, "backend", "auto"),
+                )
+            except Exception as exc:
+                logger.debug("correction capture failed (fail-open): %s",
+                             type(exc).__name__)
+
         rows = recall.ranked(
             ctx, text,
             limit=int(_cfg(ctx, "inject_top", 3)),
             shortlist_size=int(_cfg(ctx, "shortlist", 12)),
-            floor=float(_cfg(ctx, "confidence_floor", 0.55)),
+            min_lift=float(_cfg(ctx, "inject_min_lift", 1.2)),
         )
         if not rows:
             return None

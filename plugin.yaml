@@ -1,6 +1,6 @@
 name: scelestine-adept
-version: 0.1.0
-description: "Self-learning for Scelestine: records lessons, recalls and ranks them for the current task, and distills standing behaviors into SOUL.md. Storage is Mnemosyne only (no JSONL, no local lesson files). Re-ranks recall with a Jev System One call and fails open on every error path."
+version: 0.2.0
+description: "Self-learning for Scelestine: records lessons from tool failures and user corrections, recalls and ranks them for the current task, and distills standing behaviors into SOUL.md. Storage is Mnemosyne only (no JSONL, no local lesson files). Re-ranks recall with a Jev System One call and fails open on every error path."
 author: "boto-coder"
 requires_hermes: ">=0.21.0"
 hooks:

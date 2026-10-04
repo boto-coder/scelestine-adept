@@ -31,9 +31,12 @@ BEHAVIOR_CATEGORY = "behavior"
 # Lessons are global so they recall in any later session, not just this one.
 LESSON_SCOPE = "global"
 
-# Provenance tag on every lesson this plugin writes. The nightly review reads
-# rows back by this tag, so it must be stable.
+# Provenance tags this plugin writes. The nightly review reads rows back by
+# these, so they must stay stable. Two sources exist because a tool failure and
+# a user correction are both lessons but arrive by different routes.
 LESSON_SOURCE = "auto_record"
+CORRECTION_SOURCE = "user_correction"
+LESSON_SOURCES = (LESSON_SOURCE, CORRECTION_SOURCE)
 
 # Written at the head of every lesson. Makes a lesson recognisable even when a
 # row comes back without its source tag, and gives recall an exact token to
@@ -221,6 +224,9 @@ def lesson_signature(text: str) -> str:
     body = " ".join(str(text or "").split())
     if body.upper().startswith(LESSON_MARKER):
         body = body[len(LESSON_MARKER):].strip()
+    prefix = "user correction:"
+    if body.lower().startswith(prefix):
+        body = body[len(prefix):].strip()
     body = body.split(":", 1)[0]
     body = re.sub(r"\b(exit|status|code)\s*\d+\b", " ", body, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", body).strip().lower()
@@ -397,15 +403,19 @@ def _parse_ts(value: Any) -> Optional[_dt.datetime]:
     return stamp
 
 
-def _lesson_rows(rows: List[Dict[str, Any]], source: str,
+def _lesson_rows(rows: List[Dict[str, Any]], sources: Any,
                  since: Optional[_dt.datetime]) -> List[Dict[str, Any]]:
     """Keep rows that are lessons, newest first.
 
-    A row counts as a lesson when its ``source`` matches, or when the tag is
-    absent and the content carries the ``LESSON_MARKER`` prefix that
-    :func:`lesson_text` writes. Ordering is by timestamp descending, so the
+    A row counts as a lesson when its ``source`` matches one of ``sources``, or
+    when the tag is absent and the content carries the ``LESSON_MARKER`` prefix
+    that :func:`lesson_text` writes. Ordering is by timestamp descending, so the
     nightly review always looks at the most recent work first.
     """
+    if isinstance(sources, str):
+        wanted = {sources.lower()}
+    else:
+        wanted = {str(s).lower() for s in sources}
     marker = LESSON_MARKER.lower()
     picked: List[Dict[str, Any]] = []
     for row in rows:
@@ -413,7 +423,7 @@ def _lesson_rows(rows: List[Dict[str, Any]], source: str,
         if not text:
             continue
         tag = str(row.get("source") or "").strip().lower()
-        is_lesson = (tag == source.lower()) or (not tag and marker in text.lower())
+        is_lesson = (tag in wanted) or (not tag and marker in text.lower())
         if not is_lesson:
             continue
         if since is not None:
@@ -433,7 +443,7 @@ def _lesson_rows(rows: List[Dict[str, Any]], source: str,
 
 
 def recent_lessons(ctx: Any, hours: int = 24, limit: int = 20,
-                   source: str = LESSON_SOURCE) -> List[Dict[str, Any]]:
+                   source: Any = LESSON_SOURCES) -> List[Dict[str, Any]]:
     """The distinct lessons recorded in the last ``hours``, newest first.
 
     Deliberately NOT a semantic search. Recall here ranks mostly on keyword
